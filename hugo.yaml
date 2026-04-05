@@ -49,7 +49,7 @@ params:
   # Social icons on home page
   socialIcons:
     - name: github
-      url: "https://github.com/xiaoyong"
+      url: "https://github.com/xiaoyongaz"
     - name: rss
       url: "index.xml"
 
@@ -67,23 +67,24 @@ params:
       - summary
       - content
 
-  # Comments via giscus (configure after creating GitHub repo)
-  # Uncomment and fill in after enabling GitHub Discussions
-  # giscus:
-  #   repo: "xiaoyong/xiaoyong.org"
-  #   repoId: ""
-  #   category: "Comments"
-  #   categoryId: ""
-  #   mapping: "pathname"
-  #   reactionsEnabled: "1"
-  #   emitMetadata: "0"
-  #   inputPosition: "top"
-  #   theme: "preferred_color_scheme"
-  #   lang: "en"
+  comments: true
+
+  # Comments via giscus (powered by GitHub Discussions)
+  giscus:
+    repo: "xiaoyongaz/xiaoyong.org"
+    repoId: "R_kgDOR6IHwQ"
+    category: "General"
+    categoryId: "DIC_kwDOR6IHwc4C6FgI"
+    mapping: "pathname"
+    reactionsEnabled: "1"
+    emitMetadata: "0"
+    inputPosition: "top"
+    theme: "preferred_color_scheme"
+    lang: "en"
 
   # Edit post link (points to GitHub)
   editPost:
-    URL: "https://github.com/xiaoyong/xiaoyong.org/tree/main/content"
+    URL: "https://github.com/xiaoyongaz/xiaoyong.org/tree/main/content"
     Text: "Suggest Changes"
     appendFilePath: true
 

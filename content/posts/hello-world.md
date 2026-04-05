@@ -15,7 +15,7 @@ This is my first post. The site is built with [Hugo](https://gohugo.io/) and the
 - **Notes**: Quick TILs and things I've learned
 - **GitHub links**: Projects and code I'm working on
 
-The source for this site is on [GitHub](https://github.com/xiaoyong/xiaoyong.org).
+The source for this site is on [GitHub](https://github.com/xiaoyongaz/xiaoyong.org).
 
 ## Example code block
 
