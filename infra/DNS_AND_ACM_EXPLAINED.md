@@ -152,7 +152,301 @@ This is by design — ACM deduplicates when the base domain is the same.
 
 ---
 
-## 4. How It All Connects — The Full Picture
+## 4. CloudFront Distribution, S3 Bucket Policy, and DNS Records
+
+These three resources depend on each other and on the ACM certificate. Here's how
+they relate and what each does.
+
+### CloudFront Distribution
+
+CloudFront is AWS's Content Delivery Network (CDN). It caches your static site at
+**edge locations** worldwide so visitors get fast responses regardless of location.
+
+**Key configuration in our setup:**
+
+| Setting | Value | Why |
+|---|---|---|
+| Origin | S3 bucket `xiaoyong-org-site` (regional endpoint) | Where CloudFront fetches content from |
+| Origin Access Control (OAC) | `xiaoyong-org-oac` | Authenticates CloudFront → S3 requests (replaces legacy OAI) |
+| Aliases (CNAMEs) | `xiaoyong.org`, `www.xiaoyong.org` | Tells CloudFront to accept requests for these domains |
+| SSL Certificate | ACM cert (us-east-1) | Enables HTTPS for the aliases above |
+| Default Root Object | `index.html` | When someone visits `/`, serve `/index.html` |
+| Viewer Protocol Policy | `redirect-to-https` | HTTP requests get 301 redirected to HTTPS |
+| Price Class | `PriceClass_100` | Use only US/Canada/Europe edge locations (cheapest) |
+| HTTP Version | `http2and3` | Modern protocols for better performance |
+| Cache Policy | Custom (`xiaoyong-org-cache-policy`) | Brotli + gzip compression, ignore cookies/query strings |
+
+**Why it depends on ACM certificate:** CloudFront cannot serve HTTPS for custom domains
+without a valid certificate. The cert must be `ISSUED` before CloudFront will accept it.
+
+**Creation time:** CloudFront distributions take 3-8 minutes to deploy because AWS must
+propagate the configuration to all edge locations globally.
+
+### CloudFront URL Rewrite Function
+
+Hugo generates pages as `posts/hello-world/index.html`, but users visit
+`/posts/hello-world/`. CloudFront needs to map directory paths to `index.html` files.
+
+Our CloudFront Function (runs at edge, sub-millisecond):
+
+```javascript
+function handler(event) {
+  var request = event.request;
+  var uri = request.uri;
+  if (uri.endsWith('/')) {
+    request.uri += 'index.html';       // /posts/ → /posts/index.html
+  } else if (!uri.includes('.')) {
+    request.uri += '/index.html';      // /posts → /posts/index.html
+  }
+  return request;
+}
+```
+
+This runs on **viewer-request** — it modifies the request before CloudFront checks
+its cache or fetches from S3.
+
+### S3 Bucket Policy (depends on CloudFront)
+
+The S3 bucket has **all public access blocked**. Only CloudFront can read from it,
+via Origin Access Control (OAC). The bucket policy looks like:
+
+```json
+{
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::xiaoyong-org-site/*",
+    "Condition": {
+      "StringEquals": {
+        "AWS:SourceArn": "arn:aws:cloudfront::385055690025:distribution/<DIST-ID>"
+      }
+    }
+  }]
+}
+```
+
+**Why it depends on CloudFront:** The policy references the CloudFront distribution ARN
+in its condition. The distribution must exist first so its ARN is known.
+
+**Why OAC instead of public S3?**
+- **Security**: No one can bypass CloudFront and hit S3 directly
+- **Cost**: All traffic goes through CloudFront (free tier), not S3 transfer pricing
+- **Control**: CloudFront handles caching, HTTPS, and access in one place
+
+### DNS Records (depend on CloudFront)
+
+Four DNS records point your domain to the CloudFront distribution:
+
+| Record | Type | Target | Purpose |
+|---|---|---|---|
+| `xiaoyong.org` | A (Alias) | `d1234.cloudfront.net` | IPv4 root domain |
+| `www.xiaoyong.org` | A (Alias) | `d1234.cloudfront.net` | IPv4 www subdomain |
+| `xiaoyong.org` | AAAA (Alias) | `d1234.cloudfront.net` | IPv6 root domain |
+| `www.xiaoyong.org` | AAAA (Alias) | `d1234.cloudfront.net` | IPv6 www subdomain |
+
+**Why they depend on CloudFront:** The alias target is the CloudFront distribution's
+domain name, which doesn't exist until the distribution is created.
+
+**Why Alias and not CNAME?**
+- CNAME records **cannot** be used at the zone apex (`xiaoyong.org` without a subdomain)
+  — this is an RFC restriction
+- Route 53 Alias records solve this by resolving internally at the DNS level
+- Alias records to CloudFront are also **free** (no per-query charge)
+
+**The special CloudFront Hosted Zone ID:** All alias records targeting CloudFront use
+`Z2FDTNDATAQYW2` as the hosted zone ID. This is a **constant** — it's AWS's global
+hosted zone for all CloudFront distributions, not your hosted zone.
+
+### CloudFormation Dependency Chain
+
+```
+Certificate (ACM)  ─────────────────────┐
+CloudFrontOAC  ─────────────────────────┤
+CloudFrontCachePolicy  ─────────────────┤
+URLRewriteFunction  ────────────────────┤
+SiteBucket  ────────────────────────────┤
+                                        ▼
+                              CloudFrontDistribution
+                                        │
+                              ┌─────────┼──────────────────┐
+                              ▼         ▼                  ▼
+                       SiteBucketPolicy  DNSRecordRoot     DNSRecordWWW
+                                         DNSRecordRootIPv6 DNSRecordWWWIPv6
+                                                           │
+                                                           ▼
+                                                    Stack COMPLETE
+```
+
+Everything feeds into CloudFrontDistribution. Once it's created, the bucket policy
+and DNS records can be created in parallel, and then the stack completes.
+
+---
+
+## 5. How a Browser Request Gets Your Content — Step by Step
+
+When a user types `https://xiaoyong.org/posts/hello-world/` in their browser,
+here is every step that happens:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 1: DNS RESOLUTION                                                         │
+│                                                                                  │
+│  Browser: "I need the IP address for xiaoyong.org"                              │
+│                                                                                  │
+│  ┌──────────┐    ┌───────────────────┐    ┌──────────────────┐                  │
+│  │  Browser  │───▶│ Recursive Resolver│───▶│ Root DNS (.org)  │                  │
+│  └──────────┘    │  (e.g., 8.8.8.8)  │    └──────┬───────────┘                  │
+│                  │                    │           │                               │
+│                  │                    │◀──────────┘                               │
+│                  │                    │  "Ask ns-49.awsdns-06.com"               │
+│                  │                    │                                           │
+│                  │                    │───▶┌──────────────────────────┐           │
+│                  │                    │    │ Route 53 Nameserver      │           │
+│                  │                    │◀───│ (Hosted Zone records)    │           │
+│                  │                    │    └──────────────────────────┘           │
+│                  │                    │  "xiaoyong.org = 13.224.x.x"            │
+│                  └────────┬───────────┘  (CloudFront edge IP)                   │
+│                           │                                                      │
+│                           ▼                                                      │
+│                  Browser now knows: xiaoyong.org = 13.224.x.x                   │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 2: TLS HANDSHAKE (HTTPS)                                                  │
+│                                                                                  │
+│  Browser connects to 13.224.x.x:443 (nearest CloudFront edge location)         │
+│                                                                                  │
+│  ┌──────────┐         TLS ClientHello          ┌─────────────────────┐          │
+│  │  Browser  │────────────────────────────────▶│  CloudFront Edge    │          │
+│  │          │   SNI: "xiaoyong.org"            │  (e.g., SFO53-C1)  │          │
+│  │          │◀────────────────────────────────│                     │          │
+│  │          │  TLS ServerHello + Certificate   │  Presents ACM cert  │          │
+│  │          │         (ACM issued)             │  for xiaoyong.org   │          │
+│  └──────────┘                                   └─────────────────────┘          │
+│                                                                                  │
+│  Browser verifies:                                                               │
+│  ✓ Certificate is valid for xiaoyong.org                                        │
+│  ✓ Certificate is not expired                                                    │
+│  ✓ Certificate chain leads to trusted CA (Amazon Trust Services)                │
+│  ✓ Connection is now encrypted (TLS 1.2+)                                       │
+│  → Padlock appears in browser                                                    │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 3: HTTP REQUEST                                                            │
+│                                                                                  │
+│  Browser sends (over encrypted TLS connection):                                 │
+│                                                                                  │
+│    GET /posts/hello-world/ HTTP/2                                                │
+│    Host: xiaoyong.org                                                            │
+│    Accept: text/html                                                             │
+│    Accept-Encoding: gzip, br                                                     │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 4: CLOUDFRONT URL REWRITE FUNCTION (viewer-request)                       │
+│                                                                                  │
+│  The CloudFront Function runs BEFORE cache lookup:                              │
+│                                                                                  │
+│    Input URI:  /posts/hello-world/                                               │
+│    Rule:       URI ends with "/" → append "index.html"                           │
+│    Output URI: /posts/hello-world/index.html                                     │
+│                                                                                  │
+│  This happens at the edge in < 1ms                                              │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 5: CLOUDFRONT CACHE CHECK                                                  │
+│                                                                                  │
+│  CloudFront checks its edge cache for /posts/hello-world/index.html             │
+│                                                                                  │
+│  ┌─────────────────────────────────────────┐                                    │
+│  │            CACHE HIT?                    │                                    │
+│  │                                          │                                    │
+│  │  YES → Skip to Step 7 (return cached     │                                    │
+│  │         response, header: X-Cache: Hit)  │                                    │
+│  │                                          │                                    │
+│  │  NO  → Continue to Step 6 (origin fetch) │                                    │
+│  │         (header: X-Cache: Miss)          │                                    │
+│  └─────────────────────────────────────────┘                                    │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │ (cache miss)
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 6: ORIGIN FETCH (CloudFront → S3)                                         │
+│                                                                                  │
+│  CloudFront sends a request to the S3 bucket origin:                            │
+│                                                                                  │
+│  ┌─────────────────┐                      ┌──────────────────────────┐          │
+│  │  CloudFront Edge │─────────────────────▶│  S3 Bucket               │          │
+│  │                  │  GET /posts/hello-   │  (xiaoyong-org-site)     │          │
+│  │                  │  world/index.html    │                          │          │
+│  │                  │                      │  OAC Authentication:     │          │
+│  │                  │  Signed with SigV4   │  ✓ Request signed by     │          │
+│  │                  │  (OAC credentials)   │    cloudfront.amazonaws  │          │
+│  │                  │                      │    .com                  │          │
+│  │                  │◀─────────────────────│  ✓ Distribution ARN      │          │
+│  │                  │  200 OK + HTML body  │    matches bucket policy │          │
+│  └─────────────────┘                      └──────────────────────────┘          │
+│                                                                                  │
+│  S3 returns the Hugo-generated HTML file.                                       │
+│  CloudFront caches it at the edge per the cache policy (default TTL: 24hr).     │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 7: RESPONSE TO BROWSER                                                    │
+│                                                                                  │
+│  CloudFront sends the response back (compressed if supported):                  │
+│                                                                                  │
+│    HTTP/2 200 OK                                                                 │
+│    Content-Type: text/html                                                       │
+│    Content-Encoding: br  (Brotli compressed)                                    │
+│    X-Cache: Miss from cloudfront  (or "Hit" on subsequent requests)             │
+│    Via: 1.1 abc123.cloudfront.net (CloudFront)                                  │
+│    Cache-Control: public, max-age=3600                                           │
+│                                                                                  │
+│    <!DOCTYPE html>                                                               │
+│    <html>                                                                        │
+│      ... your Hugo-generated blog post ...                                       │
+│    </html>                                                                       │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  STEP 8: BROWSER RENDERS PAGE                                                    │
+│                                                                                  │
+│  Browser decompresses Brotli, parses HTML, then fetches sub-resources:          │
+│                                                                                  │
+│    /assets/css/stylesheet.min.css  ─── (same CloudFront flow, likely cached)    │
+│    /assets/js/search.min.js        ─── (same CloudFront flow, likely cached)    │
+│                                                                                  │
+│  Each sub-resource follows Steps 1-7 (DNS is cached locally, TLS reuses         │
+│  the existing connection via HTTP/2 multiplexing).                               │
+│                                                                                  │
+│  User sees: rendered blog post with syntax highlighting, dark mode toggle,      │
+│  navigation, and search — all served from the nearest CloudFront edge.          │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### What makes subsequent requests faster
+
+| Layer | First Visit | Subsequent Visits |
+|---|---|---|
+| DNS | Full resolution (~50-100ms) | Cached by OS/browser (~0ms) |
+| TLS | Full handshake (~50ms) | Session resumption (~10ms) |
+| CloudFront | Cache miss → S3 fetch | Cache hit → instant edge response |
+| Browser | Downloads all assets | Local cache (immutable assets) |
+| Compression | Brotli decompression | Already cached decompressed |
+
+---
+
+## 6. How It All Connects — Infrastructure Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -211,7 +505,7 @@ This is by design — ACM deduplicates when the base domain is the same.
 
 ---
 
-## 5. Diagnostic Commands Reference
+## 7. Diagnostic Commands Reference
 
 ### DNS Diagnostics
 
@@ -334,7 +628,7 @@ echo | openssl s_client -servername xiaoyong.org -connect xiaoyong.org:443 2>/de
 
 ---
 
-## 6. Common Issues and Fixes
+## 8. Common Issues and Fixes
 
 | Symptom | Cause | Fix |
 |---|---|---|
