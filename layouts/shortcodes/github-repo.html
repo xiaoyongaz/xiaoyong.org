@@ -1,0 +1,12 @@
+{{- /* GitHub repo card shortcode */ -}}
+{{- $repo := .Get 0 -}}
+<div style="border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin: 16px 0;">
+  <h3 style="margin: 0 0 8px 0;">
+    <a href="https://github.com/{{ $repo }}" target="_blank" rel="noopener">{{ $repo }}</a>
+  </h3>
+  <p>
+    <img src="https://img.shields.io/github/stars/{{ $repo }}?style=flat-square" alt="stars">
+    <img src="https://img.shields.io/github/forks/{{ $repo }}?style=flat-square" alt="forks">
+    <img src="https://img.shields.io/github/license/{{ $repo }}?style=flat-square" alt="license">
+  </p>
+</div>
