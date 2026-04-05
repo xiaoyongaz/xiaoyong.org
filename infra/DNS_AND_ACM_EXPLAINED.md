@@ -628,13 +628,199 @@ echo | openssl s_client -servername xiaoyong.org -connect xiaoyong.org:443 2>/de
 
 ---
 
-## 8. Common Issues and Fixes
+## 8. Issues Encountered During Setup
+
+### Issue 1: CloudFormation resource naming — dots in domain name
+
+**Symptom:** First CloudFormation deploy failed immediately with:
+
+```
+URLRewriteFunction: Value 'xiaoyong.org-url-rewrite' failed to satisfy constraint:
+  Member must satisfy regular expression pattern: [a-zA-Z0-9-_]{1,64}
+
+CloudFrontCachePolicy: The parameter Name contains characters other than
+  alphanumericals, dashes, and underscores.
+```
+
+**Root cause:** CloudFront function names and cache policy names do not allow dots (`.`).
+Our template used `${DomainName}-url-rewrite` which expanded to `xiaoyong.org-url-rewrite`.
+
+**Fix:** Replace dots with dashes in all resource names:
+
+```yaml
+# Bad:  ${DomainName}-url-rewrite  → xiaoyong.org-url-rewrite (invalid)
+# Good: xiaoyong-org-url-rewrite                               (valid)
+```
+
+Affected resources: `URLRewriteFunction`, `CloudFrontCachePolicy`, `CloudFrontOAC`,
+`SiteBucket`.
+
+**Lesson:** Always use `[a-zA-Z0-9-_]` safe names for CloudFront resources. Don't
+interpolate domain names directly — replace dots with dashes first.
+
+---
+
+### Issue 2: Registrar nameservers mismatched with hosted zone
+
+**Symptom:** ACM certificate stuck on `PENDING_VALIDATION` for extended time.
+`dig NS xiaoyong.org` returned empty results.
+
+**Root cause:** The domain was registered via Amazon Registrar, but the hosted zone had
+been recreated at some point. Each new hosted zone gets **new nameservers**, but the
+registrar still pointed to the old ones:
+
+```
+Registrar NS (stale):              Hosted Zone NS (actual):
+ns-389.awsdns-48.com               ns-49.awsdns-06.com
+ns-616.awsdns-13.net               ns-875.awsdns-45.net
+ns-1987.awsdns-56.co.uk            ns-1587.awsdns-06.co.uk
+ns-1027.awsdns-00.org              ns-1218.awsdns-24.org
+```
+
+Because the TLD was directing queries to the old (non-existent) nameservers, the ACM
+validation CNAME was unreachable, and ACM could never verify domain ownership.
+
+**How we diagnosed it:**
+
+```bash
+# Step 1: Check what the internet sees
+dig NS xiaoyong.org +short
+# Result: empty — bad sign
+
+# Step 2: Check what nameservers Route 53 expects
+aws route53 get-hosted-zone --id Z00521042ARS1I4TUAL7I \
+  --query "DelegationSet.NameServers" --profile xiaoyong-personal
+# Result: ns-49, ns-875, ns-1587, ns-1218
+
+# Step 3: Check what the registrar has
+aws route53domains get-domain-detail --domain-name xiaoyong.org \
+  --region us-east-1 --query "Nameservers[].Name" --profile xiaoyong-personal
+# Result: ns-389, ns-616, ns-1987, ns-1027 — MISMATCH!
+```
+
+**Fix:**
+
+```bash
+aws route53domains update-domain-nameservers --domain-name xiaoyong.org \
+  --region us-east-1 \
+  --nameservers Name=ns-49.awsdns-06.com Name=ns-875.awsdns-45.net \
+               Name=ns-1587.awsdns-06.co.uk Name=ns-1218.awsdns-24.org \
+  --profile xiaoyong-personal
+```
+
+**Verification:** After updating, we confirmed propagation from multiple resolvers:
+
+```bash
+dig NS xiaoyong.org @8.8.8.8 +short   # Google DNS
+dig NS xiaoyong.org @1.1.1.1 +short   # Cloudflare DNS
+
+# Also verified the ACM CNAME was reachable:
+dig CNAME _0756a5fa03640dd5d4ac7926a58e8719.xiaoyong.org @8.8.8.8 +short
+```
+
+**Lesson:** Whenever ACM validation is stuck, **always check the NS delegation chain
+first**. The CNAME record being present in Route 53 is not enough — the entire DNS
+chain from registrar → TLD → nameservers → hosted zone must be intact.
+
+---
+
+### Issue 3: Pre-existing DNS A records blocking CloudFormation
+
+**Symptom:** CloudFormation stack stuck on `CREATE_IN_PROGRESS` after all other
+resources completed. The `DNSRecordRoot` and `DNSRecordWWW` resources showed
+`CREATE_IN_PROGRESS` with no error but never completed.
+
+**Root cause:** The hosted zone already had A records for `xiaoyong.org` and
+`www.xiaoyong.org` from a previous setup attempt, pointing to an old S3 website endpoint:
+
+```json
+{
+  "Name": "xiaoyong.org.",
+  "Type": "A",
+  "AliasTarget": {
+    "HostedZoneId": "Z2F56UZL2M1ACD",
+    "DNSName": "s3-website-us-west-1.amazonaws.com."
+  }
+}
+```
+
+CloudFormation tried to create new A alias records pointing to CloudFront, but failed
+silently because records with the same name and type already existed. CloudFormation
+does not overwrite records it doesn't manage — it just hangs waiting.
+
+**How we diagnosed it:**
+
+```bash
+# Check what A/AAAA records already exist
+aws route53 list-resource-record-sets \
+  --hosted-zone-id Z00521042ARS1I4TUAL7I \
+  --query "ResourceRecordSets[?Type=='A' || Type=='AAAA']" \
+  --profile xiaoyong-personal
+
+# Found: old A records → s3-website-us-west-1.amazonaws.com (not our CloudFront!)
+```
+
+**Fix:** Manually delete the pre-existing records so CloudFormation can create its own:
+
+```bash
+aws route53 change-resource-record-sets \
+  --hosted-zone-id Z00521042ARS1I4TUAL7I \
+  --profile xiaoyong-personal \
+  --change-batch '{
+    "Changes": [
+      {
+        "Action": "DELETE",
+        "ResourceRecordSet": {
+          "Name": "xiaoyong.org.",
+          "Type": "A",
+          "AliasTarget": {
+            "HostedZoneId": "Z2F56UZL2M1ACD",
+            "DNSName": "s3-website-us-west-1.amazonaws.com.",
+            "EvaluateTargetHealth": true
+          }
+        }
+      },
+      {
+        "Action": "DELETE",
+        "ResourceRecordSet": {
+          "Name": "www.xiaoyong.org.",
+          "Type": "A",
+          "AliasTarget": {
+            "HostedZoneId": "Z2F56UZL2M1ACD",
+            "DNSName": "s3-website-us-west-1.amazonaws.com.",
+            "EvaluateTargetHealth": true
+          }
+        }
+      }
+    ]
+  }'
+```
+
+After deleting the old records, CloudFormation completed within 30 seconds.
+
+**Lesson:** Before deploying CloudFormation stacks that create DNS records, always
+check for pre-existing records in the hosted zone. CloudFormation will silently hang
+(not fail with an error) if it tries to create a record that already exists outside
+its management. Use this command to audit:
+
+```bash
+aws route53 list-resource-record-sets \
+  --hosted-zone-id <ZONE_ID> \
+  --query "ResourceRecordSets[?Type=='A' || Type=='AAAA' || Type=='CNAME']" \
+  --profile xiaoyong-personal
+```
+
+---
+
+## 9. Common Issues and Fixes (Quick Reference)
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| CloudFormation fails on resource naming | Dots in domain used in CloudFront resource names | Use `[a-zA-Z0-9-_]` safe names only |
 | `dig NS xiaoyong.org` returns nothing or wrong NS | Registrar nameservers don't match hosted zone | `update-domain-nameservers` |
 | ACM stuck on PENDING_VALIDATION | DNS not resolving validation CNAME | Fix NS records, then verify CNAME resolves with `dig` |
 | ACM status is FAILED | Validation timed out (72 hours) | Request a new certificate, ensure DNS is correct first |
+| CloudFormation hangs creating DNS records | Pre-existing records with same name/type in hosted zone | Delete old records manually, then CloudFormation proceeds |
 | CloudFront returns 403 | S3 bucket policy doesn't allow OAC, or object doesn't exist | Check bucket policy, verify `hugo --minify` output was uploaded |
 | CloudFront returns 404 on subpaths | URL rewrite function not attached or not rewriting `/path/` → `/path/index.html` | Check CloudFront function association |
 | Site loads but no HTTPS padlock | Mixed content (HTTP resources on HTTPS page) | Ensure all asset URLs use relative paths or HTTPS |
