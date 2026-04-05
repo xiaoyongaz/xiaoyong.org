@@ -1,0 +1,347 @@
+# How Domain Registration, Route 53, and ACM Work Together
+
+This document explains the full chain from domain registration to serving HTTPS traffic
+for `xiaoyong.org`, including what happens behind the scenes and how to diagnose issues.
+
+---
+
+## 1. Domain Registration (Amazon Registrar)
+
+### What is a Domain Registrar?
+
+A **domain registrar** is a company authorized by ICANN to sell domain names. When you
+register `xiaoyong.org`, the registrar:
+
+1. Reserves the name in the `.org` TLD (Top Level Domain) registry
+2. Sets **nameserver (NS) records** at the registry level — these tell the entire internet
+   "to find DNS records for xiaoyong.org, ask these nameservers"
+
+In our case, the registrar is **Amazon Registrar, Inc.** (part of Route 53 Domains).
+
+### The Nameserver Chain
+
+When someone types `xiaoyong.org` in a browser, DNS resolution follows this chain:
+
+```
+Browser → Recursive Resolver (e.g., 8.8.8.8)
+  → Root DNS servers ("who handles .org?")
+    → .org TLD servers ("who handles xiaoyong.org?")
+      → Nameservers registered for xiaoyong.org
+        → Returns the IP address (A record)
+```
+
+The critical link is step 4: the `.org` TLD servers return whichever nameservers the
+**registrar** has on file. If these don't match your hosted zone, DNS is broken.
+
+### What went wrong in our setup
+
+```
+Registrar NS (old):              Hosted Zone NS (current):
+ns-389.awsdns-48.com             ns-49.awsdns-06.com
+ns-616.awsdns-13.net             ns-875.awsdns-45.net
+ns-1987.awsdns-56.co.uk          ns-1587.awsdns-06.co.uk
+ns-1027.awsdns-00.org            ns-1218.awsdns-24.org
+```
+
+This mismatch happens when you **delete and recreate a hosted zone**. Each new hosted zone
+gets a fresh set of 4 nameservers, but the registrar still points to the old ones. The fix
+is to update the registrar's NS records to match the new hosted zone.
+
+---
+
+## 2. Route 53 Hosted Zone
+
+### What is a Hosted Zone?
+
+A **hosted zone** is a container for DNS records for a domain. It's essentially a DNS
+database that Route 53's nameservers serve to the internet.
+
+**Hosted Zone ID**: `Z00521042ARS1I4TUAL7I`
+
+When you create a hosted zone for `xiaoyong.org`, Route 53 automatically creates:
+
+- **NS record** — lists the 4 authoritative nameservers for this zone
+- **SOA record** — Start of Authority, contains zone metadata (serial number, refresh
+  intervals, admin contact)
+
+You then add your own records:
+
+| Record Type | Name | Value | Purpose |
+|---|---|---|---|
+| A (Alias) | xiaoyong.org | CloudFront distribution | Routes root domain to CDN |
+| A (Alias) | www.xiaoyong.org | CloudFront distribution | Routes www to CDN |
+| AAAA (Alias) | xiaoyong.org | CloudFront distribution | IPv6 support |
+| AAAA (Alias) | www.xiaoyong.org | CloudFront distribution | IPv6 support |
+| CNAME | _0756a5fa...xiaoyong.org | _59e1028b...acm-validations.aws | ACM certificate validation |
+
+### Alias Records vs Regular Records
+
+Route 53 **alias records** are special — they let you point a domain's apex (root, e.g.,
+`xiaoyong.org` without `www`) to an AWS resource like CloudFront. Regular DNS doesn't
+allow CNAME at the zone apex (RFC restriction), but alias records work around this by
+resolving at the Route 53 level before returning the response.
+
+### Hosted Zone vs Registrar — The Key Distinction
+
+| | Registrar | Hosted Zone |
+|---|---|---|
+| What it does | Tells the internet WHERE to look | Provides the actual DNS answers |
+| Contains | Nameserver list only | All DNS records (A, CNAME, MX, etc.) |
+| Managed at | Route 53 Domains / domain registrar | Route 53 Hosted Zones |
+| Changed via | `update-domain-nameservers` | `change-resource-record-sets` |
+
+**Both must be in sync** — the registrar points to nameservers, and those nameservers
+must be the ones serving your hosted zone.
+
+---
+
+## 3. ACM (AWS Certificate Manager)
+
+### What ACM Does
+
+ACM issues free SSL/TLS certificates for your domains. These certificates enable HTTPS
+(the padlock in the browser). For CloudFront, the certificate **must be in us-east-1**.
+
+### DNS Validation — How It Works
+
+When you request a certificate for `xiaoyong.org` and `*.xiaoyong.org`, ACM needs to
+verify you own the domain. With DNS validation:
+
+1. **ACM generates a challenge**: a unique CNAME record you must add to your DNS
+
+   ```
+   Name:  _0756a5fa03640dd5d4ac7926a58e8719.xiaoyong.org
+   Value: _59e1028b9da152e3cf9ce3bd04c754f7.htgdxnmnnj.acm-validations.aws
+   ```
+
+2. **You add the CNAME to Route 53** (CloudFormation does this automatically when you
+   specify `DomainValidationOptions` with `HostedZoneId`)
+
+3. **ACM periodically queries DNS** for this CNAME. When it resolves correctly, ACM
+   marks the certificate as `ISSUED`
+
+4. **The CNAME stays forever** — ACM uses it for automatic annual renewal too
+
+### Why Validation Was Stuck
+
+For ACM to validate, the full DNS chain must work:
+
+```
+ACM queries: _0756a5fa...xiaoyong.org
+  → .org TLD: "ask these nameservers for xiaoyong.org"
+    → Nameservers (must be Route 53's): "here's the CNAME record"
+      → ACM verifies the value matches → ISSUED
+```
+
+If the registrar's nameservers don't match the hosted zone (our bug), the TLD sends
+the query to the **wrong** nameservers, which don't have the validation CNAME, so ACM
+never sees it.
+
+### Certificate Details
+
+```
+ARN:      arn:aws:acm:us-east-1:385055690025:certificate/ff1c9d45-64be-4825-8e63-3e661b170992
+Domain:   xiaoyong.org
+SANs:     *.xiaoyong.org (wildcard — covers all subdomains)
+Region:   us-east-1 (required for CloudFront)
+Method:   DNS validation
+```
+
+Note: Both `xiaoyong.org` and `*.xiaoyong.org` use the **same** CNAME validation record.
+This is by design — ACM deduplicates when the base domain is the same.
+
+---
+
+## 4. How It All Connects — The Full Picture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        DOMAIN REGISTRATION                             │
+│                                                                        │
+│  Amazon Registrar holds: xiaoyong.org → NS records                     │
+│  Points to Route 53 nameservers:                                       │
+│    ns-49.awsdns-06.com                                                 │
+│    ns-875.awsdns-45.net                                                │
+│    ns-1587.awsdns-06.co.uk                                             │
+│    ns-1218.awsdns-24.org                                               │
+└──────────────────────┬──────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     ROUTE 53 HOSTED ZONE                               │
+│                     (Z00521042ARS1I4TUAL7I)                            │
+│                                                                        │
+│  Records served by the nameservers above:                              │
+│                                                                        │
+│  xiaoyong.org          → A (Alias) → CloudFront d1234.cloudfront.net   │
+│  www.xiaoyong.org      → A (Alias) → CloudFront d1234.cloudfront.net   │
+│  _0756a5fa...          → CNAME     → ACM validation token              │
+└──────────────────────┬──────────────────────────────────────────────────┘
+                       │
+              ┌────────┴────────┐
+              ▼                 ▼
+┌──────────────────────┐  ┌──────────────────────────────────────────────┐
+│     ACM CERTIFICATE  │  │           CLOUDFRONT DISTRIBUTION            │
+│                      │  │                                              │
+│ Validates domain     │  │  Origin: S3 bucket (xiaoyong-org-site)       │
+│ ownership via the    │  │  SSL: ACM certificate                        │
+│ CNAME record         │──│  Aliases: xiaoyong.org, www.xiaoyong.org     │
+│                      │  │  Behavior: HTTPS redirect, compress, cache   │
+│ Status: ISSUED       │  │                                              │
+└──────────────────────┘  └──────────────────┬───────────────────────────┘
+                                             │
+                                             ▼
+                          ┌──────────────────────────────────────────────┐
+                          │              S3 BUCKET                       │
+                          │         (xiaoyong-org-site)                  │
+                          │                                              │
+                          │  Contains: Hugo-generated static files       │
+                          │  Access: CloudFront OAC only (no public)     │
+                          └──────────────────────────────────────────────┘
+```
+
+### Request Flow (user visits https://xiaoyong.org)
+
+1. Browser asks recursive resolver for `xiaoyong.org`
+2. Resolver walks the DNS chain → Route 53 returns CloudFront's IP
+3. Browser connects to CloudFront via HTTPS
+4. CloudFront presents the ACM certificate (browser sees the padlock)
+5. CloudFront checks its cache; on miss, fetches from S3 via OAC
+6. Response returned to browser
+
+---
+
+## 5. Diagnostic Commands Reference
+
+### DNS Diagnostics
+
+```bash
+# Check which nameservers the internet sees for your domain
+# These must match your Route 53 hosted zone NS records
+dig NS xiaoyong.org +short
+
+# Check what nameservers Route 53 assigned to your hosted zone
+aws route53 get-hosted-zone --id Z00521042ARS1I4TUAL7I \
+  --query "DelegationSet.NameServers" --output json \
+  --profile xiaoyong-personal
+
+# Check what nameservers the registrar has on file
+# These must match the hosted zone NS records above
+aws route53domains get-domain-detail --domain-name xiaoyong.org \
+  --region us-east-1 \
+  --query "Nameservers[].Name" --output json \
+  --profile xiaoyong-personal
+
+# Fix mismatched nameservers (update registrar to match hosted zone)
+aws route53domains update-domain-nameservers --domain-name xiaoyong.org \
+  --region us-east-1 \
+  --nameservers Name=ns-49.awsdns-06.com Name=ns-875.awsdns-45.net \
+               Name=ns-1587.awsdns-06.co.uk Name=ns-1218.awsdns-24.org \
+  --profile xiaoyong-personal
+
+# List all DNS records in the hosted zone
+aws route53 list-resource-record-sets \
+  --hosted-zone-id Z00521042ARS1I4TUAL7I \
+  --profile xiaoyong-personal
+
+# Verify a specific record resolves (e.g., ACM validation CNAME)
+dig CNAME _0756a5fa03640dd5d4ac7926a58e8719.xiaoyong.org +short
+
+# Check A record resolution (after CloudFront is set up)
+dig A xiaoyong.org +short
+
+# Full DNS trace for debugging
+dig xiaoyong.org +trace
+```
+
+### ACM Certificate Diagnostics
+
+```bash
+# List all certificates for your domain
+aws acm list-certificates --region us-east-1 \
+  --query "CertificateSummaryList[?DomainName=='xiaoyong.org']" \
+  --output json \
+  --profile xiaoyong-personal
+
+# Get detailed certificate status including validation details
+aws acm describe-certificate \
+  --certificate-arn "arn:aws:acm:us-east-1:385055690025:certificate/ff1c9d45-64be-4825-8e63-3e661b170992" \
+  --region us-east-1 \
+  --query "Certificate.{Status:Status,Validations:DomainValidationOptions}" \
+  --output json \
+  --profile xiaoyong-personal
+
+# Possible Status values:
+#   PENDING_VALIDATION - waiting for DNS validation
+#   ISSUED             - validated and ready to use
+#   FAILED             - validation timed out (72 hours) or errored
+#   EXPIRED            - certificate not renewed
+```
+
+### CloudFormation Diagnostics
+
+```bash
+# Check overall stack status
+aws cloudformation describe-stacks --stack-name xiaoyong-org-site \
+  --region us-east-1 \
+  --query "Stacks[0].StackStatus" --output text \
+  --profile xiaoyong-personal
+
+# See which resources failed and why
+aws cloudformation describe-stack-events --stack-name xiaoyong-org-site \
+  --region us-east-1 \
+  --query "StackEvents[?ResourceStatus=='CREATE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+  --output table \
+  --profile xiaoyong-personal
+
+# See which resources are done vs still in progress
+aws cloudformation describe-stack-events --stack-name xiaoyong-org-site \
+  --region us-east-1 \
+  --query "StackEvents[?ResourceStatus=='CREATE_COMPLETE'].LogicalResourceId" \
+  --output table \
+  --profile xiaoyong-personal
+
+# Get stack outputs (bucket name, CloudFront distribution ID, etc.)
+aws cloudformation describe-stacks --stack-name xiaoyong-org-site \
+  --region us-east-1 \
+  --query "Stacks[0].Outputs" --output table \
+  --profile xiaoyong-personal
+```
+
+### End-to-End Verification (after deployment)
+
+```bash
+# Verify HTTPS works and check response headers
+curl -I https://xiaoyong.org
+
+# Expected headers:
+#   HTTP/2 200
+#   content-type: text/html
+#   server: AmazonS3
+#   x-cache: Hit from cloudfront (or Miss on first request)
+#   via: ... cloudfront ...
+
+# Verify HTTP redirects to HTTPS
+curl -I http://xiaoyong.org
+# Expected: 301 redirect to https://xiaoyong.org
+
+# Verify www works
+curl -I https://www.xiaoyong.org
+
+# Check SSL certificate details
+echo | openssl s_client -servername xiaoyong.org -connect xiaoyong.org:443 2>/dev/null | openssl x509 -noout -subject -dates
+```
+
+---
+
+## 6. Common Issues and Fixes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `dig NS xiaoyong.org` returns nothing or wrong NS | Registrar nameservers don't match hosted zone | `update-domain-nameservers` |
+| ACM stuck on PENDING_VALIDATION | DNS not resolving validation CNAME | Fix NS records, then verify CNAME resolves with `dig` |
+| ACM status is FAILED | Validation timed out (72 hours) | Request a new certificate, ensure DNS is correct first |
+| CloudFront returns 403 | S3 bucket policy doesn't allow OAC, or object doesn't exist | Check bucket policy, verify `hugo --minify` output was uploaded |
+| CloudFront returns 404 on subpaths | URL rewrite function not attached or not rewriting `/path/` → `/path/index.html` | Check CloudFront function association |
+| Site loads but no HTTPS padlock | Mixed content (HTTP resources on HTTPS page) | Ensure all asset URLs use relative paths or HTTPS |
+| `www.xiaoyong.org` doesn't work | Missing DNS record or missing CloudFront alternate domain | Add both A/AAAA records and both aliases on CloudFront |
